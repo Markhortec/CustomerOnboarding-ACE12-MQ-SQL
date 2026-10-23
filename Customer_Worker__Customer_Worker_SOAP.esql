@@ -1,0 +1,43 @@
+
+
+CREATE COMPUTE MODULE Customer_Worker__Customer_Worker_SOAP
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+			-- =========================================================================
+		-- CONCEPT 1: METADATA COPY
+		-- =========================================================================
+		SET OutputRoot.Properties = InputRoot.Properties;
+
+		-- =========================================================================
+		-- CONCEPT 2: POCKET PATTERN (State Preservation in Environment Tree)
+		-- =========================================================================
+		-- Problem: Jab 'Call_KYC_SOAP' HTTP node execute hoga, toh InputRoot change ho jayega.
+		-- Original customer payload delete hone se bachane ke liye hum state ko Environment mein save kar rahe hain.
+		DECLARE req  REFERENCE TO InputRoot.JSON.Data.request;
+		DECLARE cust REFERENCE TO InputRoot.JSON.Data.request.customer;
+		DECLARE corr CHARACTER InputRoot.JSON.Data.correlationId;
+
+		SET Environment.Variables.CorrelationId = COALESCE(corr, 'CORR-UNKNOWN');
+		SET Environment.Variables.RequestId     = COALESCE(req.requestId, 'REQ-UNKNOWN');
+		SET Environment.Variables.Customer      = cust;
+
+
+		-- =========================================================================
+		-- CONCEPT 3: XML / SOAP PROTOCOL TRANSFORMATION (JSON -> XMLNSC)
+		-- =========================================================================
+		-- HTTP Header specify karta hai ke hum Content-Type 'text/xml' bhej rahe hain
+		SET OutputRoot.HTTPRequestHeader."Content-Type" = 'text/xml; charset=utf-8';
+
+		-- SOAP XML Namespaces define karo (XML Nicknames)
+		DECLARE soapenv NAMESPACE 'http://schemas.xmlsoap.org/soap/envelope/';
+		DECLARE kyc     NAMESPACE 'http://bank.example.com/kyc';
+
+		-- XMLNSC Domain mein SOAP Envelope Structure build karo:
+		-- Structure: <soapenv:Envelope><soapenv:Body><kyc:VerifyCustomer>...
+		SET OutputRoot.XMLNSC.soapenv:Envelope.soapenv:Body.kyc:VerifyCustomer.kyc:CNIC        = cust.cnic;
+		SET OutputRoot.XMLNSC.soapenv:Envelope.soapenv:Body.kyc:VerifyCustomer.kyc:Name        = cust.name;
+		SET OutputRoot.XMLNSC.soapenv:Envelope.soapenv:Body.kyc:VerifyCustomer.kyc:DateOfBirth = COALESCE(cust.dateOfBirth, '1995-05-10');
+
+		RETURN TRUE; -- Message ko next node 'Call_KYC_SOAP' par bhej do
+	END;
+END MODULE;

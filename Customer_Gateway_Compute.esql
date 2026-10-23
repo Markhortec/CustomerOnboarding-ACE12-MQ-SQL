@@ -1,0 +1,154 @@
+
+
+CREATE COMPUTE MODULE Customer_Gateway_Compute
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	
+
+		BEGIN
+		
+		-- =========================================================================
+		-- CONCEPT 1: PROPERTIES & HTTP HEADERS COPY
+		-- =========================================================================
+		-- OutputRoot.Properties mein message metadata (Encoding, CCSID, CodedCharSetId) hota hai.
+		-- Isay copy karne se incoming request ka character set (UTF-8) aage wahi rehta hai.
+		SET OutputRoot.Properties = InputRoot.Properties;
+		
+		-- Client (Postman/Mobile App) ko batane ke liye ke hum JSON response bhejenge:
+		SET OutputRoot.HTTPReplyHeader."Content-Type" = 'application/json';
+
+
+		-- =========================================================================
+		-- CONCEPT 2: REFERENCE (Pointer / Shortcut For Memory & Speed)
+		-- =========================================================================
+		-- Long Path: InputRoot.JSON.Data.request.customer.cnic
+		-- Short Pointer: cust.cnic
+		-- Reference use karne se ESQL parser ki performance 10x fast hoti hai aur code clean rehta hai.
+		DECLARE req  REFERENCE TO InputRoot.JSON.Data.request;
+		DECLARE cust REFERENCE TO InputRoot.JSON.Data.request.customer;
+
+
+		-- =========================================================================
+		-- CONCEPT 3: BUSINESS VALIDATION (Defensive Programming)
+		-- =========================================================================
+		-- Defensive Check Tricks:
+		-- 1. NOT LASTMOVE(req)  -> Check karta hai ke JSON mein 'request' object exist bhi karta hai ya nahi.
+		-- 2. NOT LASTMOVE(cust) -> Check karta hai ke 'customer' object JSON mein majood hai ya missing hai.
+		-- 3. COALESCE(TRIM(val), '') = '' -> Ye 1 single line 3 mistakes pakadti hai:
+		--    a) Field NULL ho
+		--    b) Field empty string ho ("")
+		--    c) Field mein khali spaces hon ("   ")
+		
+		IF NOT LASTMOVE(req) THEN
+			-- Case 1: Root request object missing hai
+			SET OutputRoot.JSON.Data.status    = 'REJECTED';
+			SET OutputRoot.JSON.Data.errorCode = 'VAL-001';
+			SET OutputRoot.JSON.Data.message   = 'Invalid JSON Payload: "request" object is missing';
+			
+			-- Client ko error response bhejo
+			PROPAGATE TO TERMINAL 'out1';
+			RETURN FALSE; -- Flow ko yahin rok do, MQ Queue par message MAT bhejoo!
+			
+		ELSEIF NOT LASTMOVE(cust) THEN
+			-- Case 2: Customer object missing hai
+			SET OutputRoot.JSON.Data.status    = 'REJECTED';
+			SET OutputRoot.JSON.Data.errorCode = 'VAL-002';
+			SET OutputRoot.JSON.Data.message   = 'Invalid JSON Payload: "customer" object is missing';
+			
+			PROPAGATE TO TERMINAL 'out1';
+			RETURN FALSE;
+			
+		ELSEIF COALESCE(TRIM(cust.cnic), '') = '' THEN
+			-- Case 3: CNIC field missing ya empty hai
+			SET OutputRoot.JSON.Data.status    = 'REJECTED';
+			SET OutputRoot.JSON.Data.errorCode = 'VAL-003';
+			SET OutputRoot.JSON.Data.message   = 'Business Validation Error: "customer.cnic" is required';
+			
+			PROPAGATE TO TERMINAL 'out1';
+			RETURN FALSE;
+			
+		ELSEIF COALESCE(TRIM(cust.name), '') = '' THEN
+			-- Case 4: Name field missing ya empty hai
+			SET OutputRoot.JSON.Data.status    = 'REJECTED';
+			SET OutputRoot.JSON.Data.errorCode = 'VAL-004';
+			SET OutputRoot.JSON.Data.message   = 'Business Validation Error: "customer.name" is required';
+			
+			PROPAGATE TO TERMINAL 'out1';
+			RETURN FALSE;
+		END IF;
+
+
+		-- =========================================================================
+		-- CONCEPT 4: CORRELATION ID GENERATION (Audit & End-To-End Tracing)
+		-- =========================================================================
+		-- Real Banking Rule: Har transaction ke paas unique Tracking ID honi chahiye.
+		-- UUIDASCHAR -> System se Globally Unique 36-character string nikaalta hai.
+		-- SUBSTRING(UUIDASCHAR FROM 1 FOR 8) -> Shuru ke 8 Unique characters uthata hai.
+		-- CAST(CURRENT_TIMESTAMP ... 'yyyyMMdd') -> Aaj ki Date add karta hai (e.g., 20261015).
+		-- Final Format Example: CORR-20261015-8A3F1B2C
+		DECLARE uniqueCode CHARACTER SUBSTRING(UUIDASCHAR FROM 1 FOR 8);
+		DECLARE corrId     CHARACTER 'CORR-' || CAST(CURRENT_TIMESTAMP AS CHARACTER FORMAT 'yyyyMMdd') || '-' || uniqueCode;
+
+
+		-- =========================================================================
+		-- CONCEPT 5: STATE PRESERVATION (Environment Tree / Pocket Pattern)
+		-- =========================================================================
+		-- InputRoot har node ke baad CHANGE ya DELETE hota rehta hai.
+		-- Environment Tree POORE FLOW MEIN HAMESHA SAFE REHTA HAI.
+		-- Hum CorrelationId aur Customer details ko Environment (Jeb) mein save kar rahe hain
+		-- taake agle Worker/DB flow mein use kar saken.
+		SET Environment.Variables.CorrelationId = corrId;
+		SET Environment.Variables.RequestId     = req.requestId;
+		SET Environment.Variables.CustomerData  = cust;
+
+
+		-- =========================================================================
+		-- CONCEPT 6: IBM MQ PAYLOAD & TRANSPORT HEADER PREPARATION
+		-- =========================================================================
+		-- InputRoot ka structure refresh karo
+		SET OutputRoot.Properties = InputRoot.Properties;
+		
+		-- MQMD (Message Descriptor Header): IBM MQ ka standard transport header.
+		-- CREATE NEXTSIBLING -> Properties header ke bilkul saath MQMD header create karta hai.
+		CREATE NEXTSIBLING OF OutputRoot.Properties DOMAIN 'MQMD';
+		
+		-- MQMD.Format = 'MQSTR' -> MQ Server ko batata hai ke message PLAIN TEXT / JSON format mein hai.
+		SET OutputRoot.MQMD.Format = 'MQSTR';
+		
+		-- MQMD.CorrelId -> MQ Broker layer par message ko Correlation ID assign karta hai.
+		SET OutputRoot.MQMD.CorrelId = CAST(corrId AS BLOB CCSID 1208);
+
+		-- Payload build karo jo Queue par jayega
+		SET OutputRoot.JSON.Data.request       = req;
+		SET OutputRoot.JSON.Data.correlationId = corrId;
+
+		-- Message ko Terminal 'out' par bhejo (Jo MQOutput node se connected hai)
+		PROPAGATE TO TERMINAL 'out';
+
+
+		-- =========================================================================
+		-- CONCEPT 7: IMMEDIATE ASYNCHRONOUS ACKNOWLEDGEMENT (HTTP REST RESPONSE)
+		-- =========================================================================
+		-- Queue par message bhejne ke baad, ab hum OutputRoot ko CLEAR (saaf) karenge
+		-- taake Postman ko MQ Headers na jayein, balki Clean JSON Response mile!
+		SET OutputRoot.Properties = InputRoot.Properties;
+		SET OutputRoot.HTTPReplyHeader."Content-Type" = 'application/json';
+		
+		-- MQ Headers aur purana JSON payload delete karo
+		DELETE FIELD OutputRoot.MQMD;
+		DELETE FIELD OutputRoot.JSON;
+
+		-- Postman/Client ke liye Async Response banao
+		SET OutputRoot.JSON.Data.status        = 'ACCEPTED';
+		SET OutputRoot.JSON.Data.requestId     = COALESCE(req.requestId, 'REQ-UNKNOWN');
+		SET OutputRoot.JSON.Data.correlationId = corrId;
+		SET OutputRoot.JSON.Data.message       = 'Customer onboarding request accepted and queued successfully';
+
+		-- Response ko Terminal 'out1' par bhejo (Jo HTTPReply node se connected hai)
+		PROPAGATE TO TERMINAL 'out1';
+
+		-- Explicit PROPAGATE use kiya hai, isliye RETURN FALSE likhte hain
+		-- taake ACE auto-propagation se duplicate message na bhej de.
+		RETURN FALSE; 
+
+	END;
+END MODULE;

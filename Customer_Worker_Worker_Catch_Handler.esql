@@ -1,0 +1,34 @@
+
+
+CREATE COMPUTE MODULE Customer_Worker_Worker_Catch_Handler
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+BEGIN
+		SET OutputRoot.Properties = InputRoot.Properties;
+		SET OutputRoot.MQMD.Format = 'MQSTR';
+
+		-- =========================================================================
+		-- CONCEPT: EXCEPTION TREE PARSING (InputExceptionList Inspection)
+		-- =========================================================================
+		-- ACE jab crash hota hai, toh Exception Tree 'InputExceptionList' mein poora stack-trace hota hai.
+		-- Hum WHILE loop se tree ke sabse aakhri (leaf) node tak jate hain jahan ASLI error code (BIPxxxx) hota hai.
+		DECLARE ptrException REFERENCE TO InputExceptionList.*[1];
+		DECLARE textVal CHARACTER 'Unknown Exception Occurred';
+		DECLARE numVal  INT 0;
+
+		WHILE LASTMOVE(ptrException) DO
+			IF ptrException.Number IS NOT NULL THEN
+				SET numVal  = ptrException.Number;
+				SET textVal = ptrException.Text;
+			END IF;
+			MOVE ptrException LASTCHILD;
+		END WHILE;
+
+		-- Clean Error JSON Response for CUSTOMER.ERROR Queue
+		SET OutputRoot.JSON.Data.errorAudit.status      = 'CRITICAL_ERROR';
+		SET OutputRoot.JSON.Data.errorAudit.errorCode   = 'BIP' || CAST(numVal AS CHARACTER);
+		SET OutputRoot.JSON.Data.errorAudit.errorReason = textVal;
+		SET OutputRoot.JSON.Data.flowName               = 'Customer_Worker';
+
+		RETURN TRUE; -- Error log ko 'MQOutput_Error' (CUSTOMER.ERROR) queue par bhej do
+	END;
+END MODULE;

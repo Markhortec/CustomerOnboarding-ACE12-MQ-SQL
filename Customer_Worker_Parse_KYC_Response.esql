@@ -1,0 +1,41 @@
+
+
+CREATE COMPUTE MODULE Customer_Worker_Parse_KYC_Response
+	CREATE FUNCTION Main() RETURNS BOOLEAN
+	BEGIN
+		SET OutputRoot.Properties = InputRoot.Properties;
+		SET OutputRoot.MQMD.Format = 'MQSTR';
+
+		-- Gateway ke incoming JSON se data direct read karo
+		DECLARE req  REFERENCE TO InputRoot.JSON.Data.request;
+		DECLARE cust REFERENCE TO InputRoot.JSON.Data.request.customer;
+		DECLARE corr CHARACTER InputRoot.JSON.Data.correlationId;
+
+		DECLARE reqIdVal CHARACTER COALESCE(req.requestId, 'REQ-10001');
+		DECLARE cnicVal  CHARACTER COALESCE(cust.cnic, '35202-1234567-1');
+		DECLARE nameVal  CHARACTER COALESCE(cust.name, 'Hamza Winner');
+		DECLARE corrVal  CHARACTER COALESCE(corr, 'CORR-20261015-001');
+
+		-- SQL Server Direct PASSTHRU Statement
+		DECLARE sqlQuery CHARACTER 'INSERT INTO CUSTOMER (REQUEST_ID, CORRELATION_ID, CNIC, NAME, DATE_OF_BIRTH, ACCOUNT_TYPE, KYC_STATUS, RISK_LEVEL, ACCOUNT_STATUS) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
+
+		PASSTHRU sqlQuery VALUES (
+			reqIdVal,
+			corrVal,
+			cnicVal,
+			nameVal,
+			'1995-05-10',
+			'SAVINGS',
+			'VERIFIED',
+			'LOW',
+			'OPENED'
+		);
+
+		-- Success Response Output
+		SET OutputRoot.JSON.Data.status        = 'SUCCESS';
+		SET OutputRoot.JSON.Data.correlationId = corrVal;
+		SET OutputRoot.JSON.Data.message       = 'Record inserted successfully in SQL Server!';
+
+		RETURN TRUE;
+	END;
+END MODULE;
